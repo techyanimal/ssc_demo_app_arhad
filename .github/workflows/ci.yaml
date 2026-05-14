@@ -1,1 +1,74 @@
+name: Secure CI to Private Harbor
 
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# Variables for your specific NKP/Harbor environment
+env:
+  HARBOR_REGISTRY: harbor:5000
+  HARBOR_PROJECT: demoproject
+  IMAGE_NAME: ssc-demo-app
+
+permissions:
+  contents: read
+  id-token: write      # Required for OIDC/Attestations
+  attestations: write  # Required for SLSA provenance
+
+jobs:
+  build-and-push:
+    # CRITICAL: This tells GitHub to use your Rocky Linux VM
+    runs-on: self-hosted
+
+    steps:
+      # 1. Fetch the HTML and Dockerfile
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2. Security: Check Dockerfile for bad practices
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      # 3. Setup: Prepare the Docker builder on your VM
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. Auth: Login to Harbor using your GitHub Secrets
+      - name: Login to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.HARBOR_REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      # 5. Build & Push: The runner builds the image and sends it to harbor:5000
+      - name: Build and Push Image
+        id: push-image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest
+
+      # 6. Security: Scan the image for Critical vulnerabilities
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}:latest
+          format: 'table'
+          exit-code: '1' # Fails the pipeline if vulnerabilities are found
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      # 7. Security: Generate SLSA Attestation (The "Security Seal")
+      - name: Generate Attestation
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.HARBOR_REGISTRY }}/${{ env.HARBOR_PROJECT }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.push-image.outputs.digest }}
+          push-to-registry: true
